@@ -1,0 +1,204 @@
+name: publish
+
+# Publishes a staged release to this repository. Nothing here builds anything:
+# the files are built and staged elsewhere, this workflow fetches them with a
+# read-only token, checks them, signs the manifest and publishes them as
+# github-actions.
+#
+# kind=server  tag vX.Y.Z      → release vX.Y.Z with the Linux server binaries
+# kind=geo     tag geo-YYYYMMDD → release geo-YYYYMMDD with the database file,
+#                                 then geo/manifest.json on main
+#
+# Secrets (repository → Settings → Secrets and variables → Actions):
+#   STAGING_TOKEN    read-only token for the staging releases
+#   STAGING_REPO     owner/name of the staging repository
+#   PRIVATE_MARKERS  newline-separated strings that must never appear in a
+#                    published file (checked byte for byte)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: server or geo
+        required: true
+        type: choice
+        options: [server, geo]
+      tag:
+        description: vX.Y.Z (server) or geo-YYYYMMDD (geo)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      KIND: ${{ inputs.kind }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - name: Check the tag
+        run: |
+          case "$KIND" in
+            server) [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] ;;
+            geo) [[ "$TAG" =~ ^geo-[0-9]{8}$ ]] ;;
+          esac || { echo "tag '$TAG' does not fit kind '$KIND'" >&2; exit 1; }
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $TAG already exists here; published files are never replaced" >&2
+            exit 1
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Fetch the staged files
+        env:
+          GH_TOKEN: ${{ secrets.STAGING_TOKEN }}
+          STAGING_REPO: ${{ secrets.STAGING_REPO }}
+        run: |
+          mkdir staged out
+          case "$KIND" in
+            server)
+              required=(comet-x86_64-unknown-linux-musl comet-aarch64-unknown-linux-musl
+                        SHA256SUMS BUILD-METADATA.txt REPRODUCIBILITY.txt RELEASE-MANIFEST.sha256)
+              optional=(RELEASE-CONTRACT.json) ;;
+            geo)
+              required=(manifest.json "$TAG.cometdb.xz")
+              optional=(THIRD-PARTY-NOTICES.txt) ;;
+          esac
+          # Only named files are fetched. Anything else in the staging release
+          # (for example files meant only for building the App) is never downloaded.
+          for name in "${required[@]}"; do
+            gh release download "$TAG" --repo "$STAGING_REPO" --pattern "$name" --dir staged
+            [ -f "staged/$name" ] || { echo "staged release lacks $name" >&2; exit 1; }
+          done
+          for name in "${optional[@]}"; do
+            gh release download "$TAG" --repo "$STAGING_REPO" --pattern "$name" --dir staged 2>/dev/null || true
+          done
+          ls -l staged
+
+      - name: Check the server release
+        if: inputs.kind == 'server'
+        working-directory: staged
+        run: |
+          sha256sum -c SHA256SUMS
+          sha256sum -c RELEASE-MANIFEST.sha256
+          # The manifest must cover exactly the files that will be published.
+          listed="$(awk '{print $2}' RELEASE-MANIFEST.sha256 | sort)"
+          present="$(ls | grep -vx RELEASE-MANIFEST.sha256 | sort)"
+          if [ "$listed" != "$present" ]; then
+            echo "RELEASE-MANIFEST.sha256 lists:" >&2; echo "$listed" >&2
+            echo "staged files:" >&2; echo "$present" >&2
+            exit 1
+          fi
+          for binary in comet-x86_64-unknown-linux-musl comet-aarch64-unknown-linux-musl; do
+            file "$binary" | grep -q 'ELF 64-bit LSB' || { echo "$binary is not an ELF executable" >&2; exit 1; }
+          done
+
+      - name: Check the geo release
+        if: inputs.kind == 'geo'
+        working-directory: staged
+        run: |
+          python3 - "$TAG" "$GITHUB_REPOSITORY" <<'PY'
+          import base64, hashlib, json, os, sys
+          tag, repo = sys.argv[1:]
+          envelope = json.load(open("manifest.json"))
+          if set(envelope) != {"key_id", "payload", "signature"}:
+              sys.exit(f"manifest.json envelope keys {sorted(envelope)}")
+          payload = json.loads(base64.b64decode(envelope["payload"]))
+          if f"geo-{payload['version']}" != tag:
+              sys.exit(f"payload version {payload['version']} does not match {tag}")
+          blob = f"{tag}.cometdb.xz"
+          data = open(blob, "rb").read()
+          download = payload["download"]
+          if download["encoding"] != "xz" or download["size"] != len(data):
+              sys.exit(f"download encoding/size {download['encoding']}/{download['size']} vs {len(data)} bytes")
+          if download["sha256"] != hashlib.sha256(data).hexdigest():
+              sys.exit("download sha256 does not match the staged file")
+          own = f"https://github.com/{repo}/releases/download/{tag}/{blob}"
+          if own not in download["urls"]:
+              sys.exit(f"manifest urls {download['urls']} do not include {own}")
+          print(f"geo {payload['version']}: {len(data)} bytes, key {envelope['key_id']}, urls {download['urls']}")
+          PY
+
+      - name: Refuse private markers
+        env:
+          PRIVATE_MARKERS: ${{ secrets.PRIVATE_MARKERS }}
+        run: |
+          [ -n "$PRIVATE_MARKERS" ] || { echo "PRIVATE_MARKERS is not set" >&2; exit 1; }
+          found=0
+          while IFS= read -r marker; do
+            [ -n "$marker" ] || continue
+            if LC_ALL=C grep -a -F -l -i -- "$marker" staged/*; then found=1; fi
+          done <<< "$PRIVATE_MARKERS"
+          # The files are compressed for geo; the database itself is data, not paths.
+          [ "$found" = 0 ] || { echo "a staged file contains a private marker; nothing published" >&2; exit 1; }
+
+      - name: Install cosign
+        if: inputs.kind == 'server'
+        uses: sigstore/cosign-installer@ba7bc0a3fef59531c69a25acd34668d6d3fe6f22
+        with:
+          cosign-release: v3.0.6
+
+      - name: Sign the manifest (Sigstore keyless) and self-verify
+        if: inputs.kind == 'server'
+        env:
+          COSIGN_YES: "true"
+        run: |
+          cosign sign-blob --bundle staged/RELEASE-MANIFEST.sigstore.json staged/RELEASE-MANIFEST.sha256
+          cosign verify-blob staged/RELEASE-MANIFEST.sha256 \
+            --bundle staged/RELEASE-MANIFEST.sigstore.json \
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/publish.yml@${GITHUB_REF}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          case "$KIND" in
+            server)
+              notes="Server binaries $TAG. Check: sha256sum -c SHA256SUMS. The release manifest is signed with Sigstore by this repository's publish workflow."
+              files=(staged/*) ;;
+            geo)
+              notes="Geo database $TAG. The App checks the signed geo/manifest.json before using it."
+              files=("staged/$TAG.cometdb.xz")
+              [ -f staged/THIRD-PARTY-NOTICES.txt ] && files+=(staged/THIRD-PARTY-NOTICES.txt) ;;
+          esac
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes "$notes" "${files[@]}"
+
+      - name: Re-download and compare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir check
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir check
+          for file in check/*; do
+            cmp "$file" "staged/$(basename "$file")"
+          done
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        if: inputs.kind == 'geo'
+        with:
+          path: repo
+
+      - name: Point geo/manifest.json at the new database
+        if: inputs.kind == 'geo'
+        working-directory: repo
+        run: |
+          mkdir -p geo
+          cp ../staged/manifest.json geo/manifest.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add geo/manifest.json
+          git commit -m "geo: $TAG"
+          git push origin HEAD:main
+          # jsDelivr caches the branch for up to 12 hours; ask it to refetch.
+          curl -fsS "https://purge.jsdelivr.net/gh/${GITHUB_REPOSITORY}@main/geo/manifest.json" || true
